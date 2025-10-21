@@ -71,14 +71,30 @@ def compile_rules(rules):
 def get_context(paras, i, win=1):
     start = max(0, i - win)
     end   = min(len(paras), i + win + 1)
-    before = "\n".join([normalize_output(x) for x in paras[start:i] if normalize_output(x)])
-    after  = "\n".join([normalize_output(x) for x in paras[i+1:end] if normalize_output(x)])
+
+    def cleaned(idx):
+        return normalize_output(paras[idx]["text"])
+
+    before_values = []
+    for idx in range(start, i):
+        value = cleaned(idx)
+        if value:
+            before_values.append(value)
+
+    after_values = []
+    for idx in range(i + 1, end):
+        value = cleaned(idx)
+        if value:
+            after_values.append(value)
+
+    before = "\n".join(before_values)
+    after = "\n".join(after_values)
     return before, after
 
 def find_hits(paragraphs, compiled, context_win=1):
     hits = []
-    for i, txt in enumerate(paragraphs):
-        raw = normalize_output(txt)
+    for i, para in enumerate(paragraphs):
+        raw = normalize_output(para["text"])
         if not raw:
             continue
         base = strip_accents(raw.lower())  # on matche sans accents
@@ -90,6 +106,7 @@ def find_hits(paragraphs, compiled, context_win=1):
                 "index_paragraphe": i,
                 "termes_trouves": ", ".join(matched),
                 "extrait": raw,
+                "style_titre": para.get("style", ""),
                 "contexte_avant": before,
                 "contexte_apres": after
             })
@@ -99,16 +116,41 @@ def main():
     assert DOCX_PATH.exists(), f"Fichier introuvable : {DOCX_PATH}"
     doc = docx.Document(str(DOCX_PATH))
 
-    # Paragraphes + cellules de tableaux (chaque ligne comme mini-paragraphe)
-    paras = [p.text for p in doc.paragraphs]
+    # Paragraphes + paragraphes des cellules de tableaux (style compris)
+    paras = []
+
+    def append_paragraph(paragraph):
+        style_name = ""
+        try:
+            style = paragraph.style
+            if style is not None and hasattr(style, "name"):
+                style_name = normalize_output(style.name)
+        except Exception:
+            style_name = ""
+        paras.append({
+            "text": paragraph.text,
+            "style": style_name,
+        })
+
+    for p in doc.paragraphs:
+        append_paragraph(p)
+
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
-                paras.extend(cell.text.splitlines())
+                for p in cell.paragraphs:
+                    append_paragraph(p)
 
     compiled = compile_rules(RULES)
     rows = find_hits(paras, compiled, context_win=CONTEXT_WIN)
-    df = pd.DataFrame(rows, columns=["index_paragraphe","termes_trouves","extrait","contexte_avant","contexte_apres"])
+    df = pd.DataFrame(rows, columns=[
+        "index_paragraphe",
+        "termes_trouves",
+        "extrait",
+        "style_titre",
+        "contexte_avant",
+        "contexte_apres",
+    ])
 
     ensure_dir(OUT_DIR)
     out_csv = OUT_DIR / "extraits_constit_grenier.csv"
@@ -120,7 +162,11 @@ def main():
     # TXT lisible (UTF-8 BOM)
     with out_txt.open("w", encoding="utf-8-sig", newline="\n") as f:
         for idx, row in df.iterrows():
-            f.write(f"--- HIT #{idx + 1} | paragraphe {row['index_paragraphe']} | {row['termes_trouves']}\n")
+            style = row.get("style_titre", "")
+            style_txt = f" | style : {style}" if isinstance(style, str) and style else ""
+            f.write(
+                f"--- HIT #{idx + 1} | paragraphe {row['index_paragraphe']} | {row['termes_trouves']}{style_txt}\n"
+            )
             f.write(f"{row['extrait']}\n")
             if row['contexte_avant']:
                 f.write(f"[avant] {row['contexte_avant']}\n")
