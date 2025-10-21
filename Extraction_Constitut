@@ -1,0 +1,134 @@
+# -*- coding: utf-8 -*-
+import re
+import unicodedata
+import pandas as pd
+from pathlib import Path
+
+# ========= Paramètres que tu modifies =========
+DOCX_PATH  = Path(r"C:/Users/samue/Documents/Doctorat/Contrats/Laura/Services de garde et RI-RTF/PL49/PL49_Compilations.docx")
+OUT_DIR    = Path(r"C:/Users/samue/Documents/Doctorat/Contrats/Laura/Services de garde et RI-RTF/Tableaux")
+CONTEXT_WIN = 1  # 0 = aucun contexte, 1 = +/-1 paragraphe, 2 = +/-2, etc.
+
+# Une seule liste à éditer :
+RULES = [
+    "constitut",          # mot -> capte constitutionnel, constitutionnalité…
+    "grenier",               # mot
+    "jugement grenier",      # phrase -> espaces flexibles
+    # exemples regex brutes (sur texte "sans accents") :
+    # "re:loi\\s*(?:n[°o]?|numero)?\\s*7",
+    # "re:inconstitutionnel(le)?s?"
+]
+# ==============================================
+
+# Dépendance : python-docx
+try:
+    import docx  # pip install python-docx
+except Exception as e:
+    raise RuntimeError(f"Le module python-docx n'est pas disponible : {e}")
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def normalize_output(s: str) -> str:
+    """NFC + remplace les espaces insécables par des espaces classiques."""
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFC", s)
+    return s.replace("\u00A0", " ").strip()
+
+def strip_accents(s: str) -> str:
+    return ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
+
+def to_regex(rule: str):
+    """
+    Transforme une règle utilisateur en (label, motif_compilé).
+    - 're:...' -> regex brute (écrite sans accents), _pas_ de modification
+    - 'mot'    -> borne de mot + \w*  (variantes)
+    - 'phrase' -> espaces -> \s+ (souple)
+    Le match se fait sur une copie du texte 'sans accents'.
+    """
+    if rule.startswith("re:"):
+        raw = rule[3:]
+        label = f"regex:{raw}"
+        pat = re.compile(raw, re.IGNORECASE)
+        return label, pat
+
+    t = strip_accents(rule.lower().strip())
+    if " " in t:
+        # phrase : espaces flexibles
+        t = re.sub(r"\s+", r"\\s+", re.escape(t))
+        label = f"phrase:{rule}"
+        return label, re.compile(t, re.IGNORECASE)
+    else:
+        # mot : limite + variations
+        t = re.escape(t)
+        label = f"mot:{rule}"
+        return label, re.compile(rf"\b{t}\w*", re.IGNORECASE)
+
+def compile_rules(rules):
+    return [to_regex(r) for r in rules]
+
+def get_context(paras, i, win=1):
+    start = max(0, i - win)
+    end   = min(len(paras), i + win + 1)
+    before = "\n".join([normalize_output(x) for x in paras[start:i] if normalize_output(x)])
+    after  = "\n".join([normalize_output(x) for x in paras[i+1:end] if normalize_output(x)])
+    return before, after
+
+def find_hits(paragraphs, compiled, context_win=1):
+    hits = []
+    for i, txt in enumerate(paragraphs):
+        raw = normalize_output(txt)
+        if not raw:
+            continue
+        base = strip_accents(raw.lower())  # on matche sans accents
+
+        matched = [label for (label, rx) in compiled if rx.search(base)]
+        if matched:
+            before, after = get_context(paragraphs, i, win=context_win)
+            hits.append({
+                "index_paragraphe": i,
+                "termes_trouves": ", ".join(matched),
+                "extrait": raw,
+                "contexte_avant": before,
+                "contexte_apres": after
+            })
+    return hits
+
+def main():
+    assert DOCX_PATH.exists(), f"Fichier introuvable : {DOCX_PATH}"
+    doc = docx.Document(str(DOCX_PATH))
+
+    # Paragraphes + cellules de tableaux (chaque ligne comme mini-paragraphe)
+    paras = [p.text for p in doc.paragraphs]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                paras.extend(cell.text.splitlines())
+
+    compiled = compile_rules(RULES)
+    rows = find_hits(paras, compiled, context_win=CONTEXT_WIN)
+    df = pd.DataFrame(rows, columns=["index_paragraphe","termes_trouves","extrait","contexte_avant","contexte_apres"])
+
+    ensure_dir(OUT_DIR)
+    out_csv = OUT_DIR / "extraits_constit_grenier.csv"
+    out_txt = OUT_DIR / "extraits_constit_grenier.txt"
+
+    # CSV (UTF-8 BOM + séparateur ;)
+    df.to_csv(out_csv, index=False, encoding="utf-8-sig", sep=';', lineterminator='\n')
+
+    # TXT lisible (UTF-8 BOM)
+    with out_txt.open("w", encoding="utf-8-sig", newline="\n") as f:
+        for idx, row in df.iterrows():
+            f.write(f"--- HIT #{idx + 1} | paragraphe {row['index_paragraphe']} | {row['termes_trouves']}\n")
+            f.write(f"{row['extrait']}\n")
+            if row['contexte_avant']:
+                f.write(f"[avant] {row['contexte_avant']}\n")
+            if row['contexte_apres']:
+                f.write(f"[après] {row['contexte_apres']}\n")
+            f.write("\n")
+
+    print(f"OK : {len(df)} occurrences | CSV : {out_csv} | TXT : {out_txt}")
+
+if __name__ == "__main__":
+    main()
