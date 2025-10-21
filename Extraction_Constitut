@@ -98,15 +98,16 @@ def find_hits(paragraphs, compiled, context_win=1):
         if not raw:
             continue
         base = strip_accents(raw.lower())  # on matche sans accents
+        line_number = para.get("line_number", i + 1)
 
         matched = [label for (label, rx) in compiled if rx.search(base)]
         if matched:
             before, after = get_context(paragraphs, i, win=context_win)
             hits.append({
-                "index_paragraphe": i,
+                "paragraphe": line_number,
                 "termes_trouves": ", ".join(matched),
                 "extrait": raw,
-                "style_titre": para.get("style", ""),
+                "titre_section": normalize_output(para.get("titre_section", "")),
                 "contexte_avant": before,
                 "contexte_apres": after
             })
@@ -119,17 +120,37 @@ def main():
     # Paragraphes + paragraphes des cellules de tableaux (style compris)
     paras = []
 
-    def append_paragraph(paragraph):
-        style_name = ""
+    def paragraph_style_name(paragraph):
         try:
             style = paragraph.style
             if style is not None and hasattr(style, "name"):
-                style_name = normalize_output(style.name)
+                return normalize_output(style.name)
         except Exception:
-            style_name = ""
+            pass
+        return ""
+
+    def is_title_style(style_name):
+        if not style_name:
+            return False
+        lowered = style_name.lower()
+        return any(keyword in lowered for keyword in ("heading", "titre"))
+
+    current_title = ""
+    line_counter = 0
+
+    def append_paragraph(paragraph):
+        nonlocal current_title, line_counter
+        text = paragraph.text or ""
+        style_name = paragraph_style_name(paragraph)
+        if is_title_style(style_name):
+            normalized_title = normalize_output(text)
+            current_title = normalized_title or current_title
+        line_counter += 1
         paras.append({
-            "text": paragraph.text,
+            "text": text,
             "style": style_name,
+            "titre_section": current_title,
+            "line_number": line_counter,
         })
 
     for p in doc.paragraphs:
@@ -144,10 +165,10 @@ def main():
     compiled = compile_rules(RULES)
     rows = find_hits(paras, compiled, context_win=CONTEXT_WIN)
     df = pd.DataFrame(rows, columns=[
-        "index_paragraphe",
+        "paragraphe",
         "termes_trouves",
         "extrait",
-        "style_titre",
+        "titre_section",
         "contexte_avant",
         "contexte_apres",
     ])
@@ -162,10 +183,10 @@ def main():
     # TXT lisible (UTF-8 BOM)
     with out_txt.open("w", encoding="utf-8-sig", newline="\n") as f:
         for idx, row in df.iterrows():
-            style = row.get("style_titre", "")
-            style_txt = f" | style : {style}" if isinstance(style, str) and style else ""
+            titre = row.get("titre_section", "")
+            titre_txt = f" | titre : {titre}" if isinstance(titre, str) and titre else ""
             f.write(
-                f"--- HIT #{idx + 1} | paragraphe {row['index_paragraphe']} | {row['termes_trouves']}{style_txt}\n"
+                f"--- HIT #{idx + 1} | paragraphe {row['paragraphe']} | {row['termes_trouves']}{titre_txt}\n"
             )
             f.write(f"{row['extrait']}\n")
             if row['contexte_avant']:
