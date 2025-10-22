@@ -39,6 +39,16 @@ def normalize_output(s: str) -> str:
 def strip_accents(s: str) -> str:
     return ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
 
+def extract_interlocutor(text: str) -> str:
+    """Extraire le nom de l'interlocuteur en début de paragraphe."""
+    if not text:
+        return ""
+    first_line = text.splitlines()[0]
+    if ':' not in first_line:
+        return ""
+    before_colon = first_line.split(':', 1)[0]
+    return normalize_output(before_colon)
+
 def to_regex(rule: str):
     """
     Transforme une règle utilisateur en (label, motif_compilé).
@@ -108,6 +118,7 @@ def find_hits(paragraphs, compiled, context_win=1):
                 "termes_trouves": ", ".join(matched),
                 "extrait": raw,
                 "titre_section": normalize_output(para.get("titre_section", "")),
+                "interlocuteur": normalize_output(para.get("interlocuteur", "")),
                 "contexte_avant": before,
                 "contexte_apres": after
             })
@@ -145,11 +156,13 @@ def main():
         if is_title_style(style_name):
             normalized_title = normalize_output(text)
             current_title = normalized_title or current_title
+        interlocuteur = extract_interlocutor(text)
         line_counter += 1
         paras.append({
             "text": text,
             "style": style_name,
             "titre_section": current_title,
+            "interlocuteur": interlocuteur,
             "line_number": line_counter,
         })
 
@@ -169,6 +182,7 @@ def main():
         "termes_trouves",
         "extrait",
         "titre_section",
+        "interlocuteur",
         "contexte_avant",
         "contexte_apres",
     ])
@@ -185,8 +199,14 @@ def main():
         for idx, row in df.iterrows():
             titre = row.get("titre_section", "")
             titre_txt = f" | titre : {titre}" if isinstance(titre, str) and titre else ""
+            interlocuteur = row.get("interlocuteur", "")
+            interlocuteur_txt = (
+                f" | interlocuteur : {interlocuteur}"
+                if isinstance(interlocuteur, str) and interlocuteur
+                else ""
+            )
             f.write(
-                f"--- HIT #{idx + 1} | ligne {row['ligne']} | {row['termes_trouves']}{titre_txt}\n"
+                f"--- HIT #{idx + 1} | ligne {row['ligne']} | {row['termes_trouves']}{titre_txt}{interlocuteur_txt}\n"
             )
             f.write(f"{row['extrait']}\n")
             if row['contexte_avant']:
