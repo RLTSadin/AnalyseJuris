@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Extraction des discussions par paragraphe à partir d'un fichier .docx.
-Produit un fichier Excel avec les colonnes : Paragraphe | Page | Référence | Texte.
+Produit un fichier Excel avec les colonnes :
+Paragraphe | Page | Référence | Interlocuteur détecté | Interlocuteur courant | Texte.
 
 Dépendances : pandas, xlsxwriter
 """
@@ -151,16 +152,46 @@ def load_docx_paragraphs(docx_path: Path) -> List[Dict[str, int | str]]:
             # Si le premier paragraphe contient un saut de page, on considère que la numérotation commence à 1
             page_number = max(page_number, 1)
 
-        runs = [node.text for node in element.findall(".//w:t", ns) if node.text]
-        raw_text = "".join(runs).strip()
-        if not raw_text:
+        segments = []
+        for run in element.findall(".//w:r", ns):
+            texts = [node.text for node in run.findall(".//w:t", ns) if node.text]
+            if not texts:
+                continue
+
+            run_text = "".join(texts)
+            run_props = run.find("w:rPr", ns)
+            is_bold = False
+            if run_props is not None:
+                is_bold = run_props.find("w:b", ns) is not None or run_props.find("w:bCs", ns) is not None
+
+            segments.append({"text": run_text, "bold": is_bold})
+
+        full_text = "".join(segment["text"] for segment in segments)
+        if not full_text.strip():
             continue
+
+        runs: List[Dict[str, int | str]] = []
+        cursor = 0
+        for segment in segments:
+            text = segment["text"]
+            runs.append(
+                {
+                    "text": text,
+                    "start": cursor,
+                    "end": cursor + len(text),
+                    "bold": bool(segment["bold"]),
+                }
+            )
+            cursor += len(text)
+
+        speaker = detect_speaker(full_text, runs)
 
         paragraphs.append(
             {
                 "index": paragraph_index,
                 "page": page_number,
-                "text": raw_text,
+                "text": full_text,
+                "speaker": speaker,
             }
         )
         paragraph_index += 1
@@ -180,15 +211,54 @@ def contains_adoption_marker(text: str) -> bool:
     return any(term in normalized for term in ADOPTION_TERMS)
 
 
+def detect_speaker(text: str, runs: List[Dict[str, int | str]]) -> str | None:
+    """Identifie l'interlocuteur si le nom est en gras et suivi d'un deux-points."""
+
+    colon_index = text.find(":")
+    if colon_index == -1 or colon_index > 120:
+        return None
+
+    # Ignore les espaces en début de paragraphe
+    prefix_start = None
+    for idx, char in enumerate(text[:colon_index]):
+        if not char.isspace():
+            prefix_start = idx
+            break
+
+    if prefix_start is None or prefix_start >= colon_index:
+        return None
+
+    prefix_end = colon_index
+
+    # Vérifie que toutes les lettres (hors espaces) avant le deux-points sont en gras
+    for position in range(prefix_start, prefix_end):
+        character = text[position]
+        if character.isspace():
+            continue
+
+        run = next((item for item in runs if item["start"] <= position < item["end"]), None)
+        if run is None or not run["bold"]:
+            return None
+
+    candidate = normalize_text(text[prefix_start:prefix_end])
+    return candidate or None
+
+
 def build_paragraph_dataframe(docx_path: Path) -> pd.DataFrame:
     paragraphs = load_docx_paragraphs(docx_path)
     rows: List[Dict[str, int | str]] = []
     current_articles: List[str] = []
+    current_speaker: str = ""
 
     for paragraph in paragraphs:
         text = normalize_text(paragraph["text"])
         mentions = extract_article_mentions(text)
         adoption = contains_adoption_marker(text)
+        detected_speaker = paragraph.get("speaker")
+
+        if detected_speaker:
+            current_speaker = normalize_text(detected_speaker)
+        detected_value = normalize_text(detected_speaker) if detected_speaker else ""
 
         if mentions:
             mentions = sorted(mentions, key=sort_article_key)
@@ -200,6 +270,8 @@ def build_paragraph_dataframe(docx_path: Path) -> pd.DataFrame:
                     "Paragraphe": paragraph["index"] + 1,
                     "Page": paragraph["page"],
                     "Référence": ", ".join(current_articles),
+                    "Interlocuteur détecté": detected_value,
+                    "Interlocuteur courant": current_speaker,
                     "Texte": text,
                 }
             )
@@ -207,7 +279,17 @@ def build_paragraph_dataframe(docx_path: Path) -> pd.DataFrame:
         if adoption:
             current_articles = []
 
-    return pd.DataFrame(rows, columns=["Paragraphe", "Page", "Référence", "Texte"])
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "Paragraphe",
+            "Page",
+            "Référence",
+            "Interlocuteur détecté",
+            "Interlocuteur courant",
+            "Texte",
+        ],
+    )
 
 
 def main() -> None:
@@ -223,7 +305,8 @@ def main() -> None:
         worksheet.set_column(0, 0, 12)
         worksheet.set_column(1, 1, 8)
         worksheet.set_column(2, 2, 20)
-        worksheet.set_column(3, 3, 120)
+        worksheet.set_column(3, 4, 28)
+        worksheet.set_column(5, 5, 120)
 
     print(f"✅ Fichier écrit : {OUT_XLSX}")
 
