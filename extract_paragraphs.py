@@ -13,12 +13,20 @@ import re
 import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import pandas as pd
 
-AffiliationMap = Dict[str, Dict[str, str]]
+
+
+@dataclass
+class AffiliationEntry:
+    label: str
+    tokens: List[str]
+    fonction: str
+    organisation: str
 
 # ========= À PERSONNALISER =========
 IN_DOCX = Path(
@@ -84,52 +92,246 @@ def strip_accents(value: str) -> str:
     )
 
 
-def normalize_speaker_key(value: str) -> str:
-    cleaned = normalize_text(value)
-    cleaned = strip_accents(cleaned).lower()
-    cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned)
-    return re.sub(r"\s+", " ", cleaned).strip()
+def norm_column_label(value: str) -> str:
+    value = "" if value is None else str(value)
+    value = value.replace("\ufeff", "")
+    value = strip_accents(value).lower().strip()
+    value = value.replace("/", " ").replace("-", " ").replace("_", " ")
+    value = re.sub(r"\s+", " ", value)
+    return value
 
 
-def resolve_column_name(columns: List[str], target: str) -> str:
-    target_lower = target.lower()
-    for column in columns:
-        if column.lower() == target_lower:
-            return column
-    raise KeyError(f"Colonne '{target}' introuvable dans le fichier des intervenants")
+def normalize_label(value: str) -> str:
+    if not isinstance(value, str):
+        return ""
+
+    cleaned = strip_accents(value).lower()
+
+    for parenthetical in re.findall(r"\(([^)]+)\)", cleaned):
+        cleaned += " " + parenthetical
+
+    cleaned = re.sub(r"[’'\".,;!?()\[\]{}]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    honorifics = {
+        "m",
+        "mm",
+        "mme",
+        "mmes",
+        "mlle",
+        "me",
+        "dr",
+        "monsieur",
+        "madame",
+        "mademoiselle",
+        "le",
+        "la",
+        "president",
+        "presidente",
+        "vice-president",
+        "vice-presidente",
+        "depute",
+        "deputee",
+        "ministre",
+        "leader",
+        "secretaire",
+        "une",
+        "des",
+        "voix",
+    }
+
+    tokens = [token for token in cleaned.split() if token not in honorifics]
+    tokens = [re.sub(r"[^a-z0-9\-]", "", token) for token in tokens if token]
+    return " ".join(token for token in tokens if token)
 
 
-def load_affiliations(xlsx_path: Path) -> AffiliationMap:
+def tokenize_for_match(value: str) -> List[str]:
+    return [token for token in normalize_label(value).split() if token]
+
+
+def pick_best_match(
+    src_tokens: List[str],
+    candidates: List[Tuple[int, str, List[str]]],
+    min_overlap: int = 2,
+    jaccard_floor: float = 0.34,
+) -> Tuple[int, str, List[str]] | None:
+    if not src_tokens or not candidates:
+        return None
+
+    src_set = set(src_tokens)
+    best: Tuple[int, str, List[str]] | None = None
+    best_key = (-1, -1.0, -1)
+
+    for idx, label, tokens in candidates:
+        token_set = set(tokens)
+        overlap = len(src_set & token_set)
+        if overlap < min_overlap:
+            continue
+
+        jaccard = overlap / max(1, len(src_set | token_set))
+        key = (overlap, jaccard, len(tokens))
+        if key > best_key:
+            best_key = key
+            best = (idx, label, tokens)
+
+    if best is not None:
+        return best
+
+    if len(src_tokens) == 1:
+        one_token_matches: List[Tuple[float, int, Tuple[int, str, List[str]]]] = []
+        for idx, label, tokens in candidates:
+            token_set = set(tokens)
+            overlap = len(src_set & token_set)
+            if overlap != 1:
+                continue
+
+            jaccard = overlap / max(1, len(src_set | token_set))
+            one_token_matches.append((jaccard, len(tokens), (idx, label, tokens)))
+
+        if not one_token_matches:
+            return None
+
+        if len(one_token_matches) == 1:
+            return one_token_matches[0][2]
+
+        one_token_matches.sort(reverse=True)
+        best_jaccard, _, best_candidate = one_token_matches[0]
+        if best_jaccard >= jaccard_floor:
+            return best_candidate
+
+    return None
+
+
+def find_column_by_names(
+    dataframe: pd.DataFrame,
+    wanted_exact: List[str],
+    wanted_contains: List[str],
+    label_for_error: str,
+    required: bool = True,
+) -> str | None:
+    normalized_columns = {norm_column_label(column): column for column in dataframe.columns}
+
+    for key in wanted_exact:
+        normalized_key = norm_column_label(key)
+        if normalized_key and normalized_key in normalized_columns:
+            return normalized_columns[normalized_key]
+
+    for normalized_key, original in normalized_columns.items():
+        if any(substring in normalized_key for substring in wanted_contains):
+            return original
+
+    if required:
+        available = ", ".join(
+            f"{normalized} -> {original}" for normalized, original in normalized_columns.items()
+        )
+        raise KeyError(
+            f"Colonne '{label_for_error}' introuvable dans le fichier des intervenants. "
+            f"En-têtes disponibles (normalisés -> originaux) : {available}"
+        )
+
+    return None
+
+
+def load_affiliations(xlsx_path: Path) -> List[AffiliationEntry]:
     if not xlsx_path.exists():
-        return {}
+        return []
 
     dataframe = pd.read_excel(xlsx_path)
     if dataframe.empty:
-        return {}
+        return []
 
-    name_col = resolve_column_name(list(dataframe.columns), INTERVENANT_NOM_COL)
-    fonction_col = resolve_column_name(list(dataframe.columns), INTERVENANT_FONCTION_COL)
-    organisation_col = resolve_column_name(list(dataframe.columns), INTERVENANT_ORGANISATION_COL)
+    name_column = find_column_by_names(
+        dataframe,
+        wanted_exact=[
+            INTERVENANT_NOM_COL,
+            "interlocuteur",
+            "nom",
+            "nom complet",
+            "nom prenom",
+            "nom et prenom",
+            "full name",
+            "name",
+        ],
+        wanted_contains=["interloc", "nom", "name"],
+        label_for_error="Nom (Intervenant)",
+        required=True,
+    )
 
-    mapping: AffiliationMap = {}
+    fonction_column = find_column_by_names(
+        dataframe,
+        wanted_exact=[
+            INTERVENANT_FONCTION_COL,
+            "fonction ou titre",
+            "fonction titre",
+            "fonction",
+            "titre",
+            "titre du poste",
+            "intitule du poste",
+            "intitulé du poste",
+            "poste",
+            "role",
+            "rôle",
+        ],
+        wanted_contains=["fonction", "titre", "poste", "role", "rôle"],
+        label_for_error="Fonction ou titre",
+        required=False,
+    )
+
+    organisation_column = find_column_by_names(
+        dataframe,
+        wanted_exact=[
+            INTERVENANT_ORGANISATION_COL,
+            "organisation",
+            "organisme",
+            "organisation organisme",
+            "organisation/organisme",
+            "organization",
+            "affiliation",
+            "ministere",
+            "ministère",
+            "parti",
+            "service",
+        ],
+        wanted_contains=["organis", "affilia", "ministere", "minist", "parti", "service"],
+        label_for_error="Organisation",
+        required=False,
+    )
+
+    if fonction_column is None:
+        print(
+            "[AVERTISSEMENT] Colonne 'Fonction ou titre' non trouvée dans le répertoire ; la colonne sera laissée vide."
+        )
+    if organisation_column is None:
+        print(
+            "[AVERTISSEMENT] Colonne 'Organisation' non trouvée dans le répertoire ; la colonne sera laissée vide."
+        )
+
+    entries: List[AffiliationEntry] = []
     for _, row in dataframe.iterrows():
-        raw_name = row.get(name_col, "")
+        raw_name = row.get(name_column, "")
         if pd.isna(raw_name):
             continue
 
-        key = normalize_speaker_key(str(raw_name))
-        if not key:
+        tokens = tokenize_for_match(str(raw_name))
+        if not tokens:
             continue
 
-        fonction_value = row.get(fonction_col, "")
-        organisation_value = row.get(organisation_col, "")
+        fonction_value = row.get(fonction_column, "") if fonction_column else ""
+        organisation_value = row.get(organisation_column, "") if organisation_column else ""
 
         fonction = "" if pd.isna(fonction_value) else str(fonction_value).strip()
         organisation = "" if pd.isna(organisation_value) else str(organisation_value).strip()
 
-        mapping[key] = {"fonction": fonction, "organisation": organisation}
+        entries.append(
+            AffiliationEntry(
+                label=str(raw_name).strip(),
+                tokens=tokens,
+                fonction=fonction,
+                organisation=organisation,
+            )
+        )
 
-    return mapping
+    return entries
 
 
 def expand_range(start: str, end: str) -> List[str]:
@@ -173,6 +375,31 @@ def extract_article_mentions(text: str) -> List[str]:
             ordered.append(number)
             seen.add(number)
     return ordered
+
+
+def resolve_affiliation(
+    speaker_name: str,
+    directory: List[AffiliationEntry],
+    cache: Dict[str, Tuple[str, str]],
+) -> Tuple[str, str]:
+    if speaker_name in cache:
+        return cache[speaker_name]
+
+    tokens = tokenize_for_match(speaker_name)
+    if not tokens or not directory:
+        cache[speaker_name] = ("", "")
+        return cache[speaker_name]
+
+    candidates = [(index, entry.label, entry.tokens) for index, entry in enumerate(directory)]
+    match = pick_best_match(tokens, candidates)
+    if match is None:
+        cache[speaker_name] = ("", "")
+        return cache[speaker_name]
+
+    index, _, _ = match
+    entry = directory[index]
+    cache[speaker_name] = (entry.fonction, entry.organisation)
+    return cache[speaker_name]
 
 
 def load_docx_paragraphs(docx_path: Path) -> List[Dict[str, int | str]]:
@@ -307,7 +534,8 @@ def build_paragraph_dataframe(docx_path: Path) -> pd.DataFrame:
     rows: List[Dict[str, int | str]] = []
     current_articles: List[str] = []
     current_speaker: str = ""
-    affiliations = load_affiliations(INTERVENANTS_XLSX)
+    affiliation_directory = load_affiliations(INTERVENANTS_XLSX)
+    affiliation_cache: Dict[str, Tuple[str, str]] = {}
 
     for paragraph in paragraphs:
         text = normalize_text(paragraph["text"])
@@ -322,11 +550,9 @@ def build_paragraph_dataframe(docx_path: Path) -> pd.DataFrame:
         fonction = ""
         organisation = ""
         if current_speaker:
-            affiliation_key = normalize_speaker_key(current_speaker)
-            affiliation = affiliations.get(affiliation_key)
-            if affiliation:
-                fonction = affiliation.get("fonction", "")
-                organisation = affiliation.get("organisation", "")
+            fonction, organisation = resolve_affiliation(
+                current_speaker, affiliation_directory, affiliation_cache
+            )
 
         if mentions:
             mentions = sorted(mentions, key=sort_article_key)
